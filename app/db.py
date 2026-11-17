@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator
@@ -13,14 +14,13 @@ from . import config
 _SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
-PRAGMA busy_timeout=30000;
 PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS jobs (
     job_id          TEXT PRIMARY KEY,
     lane            TEXT NOT NULL UNIQUE,
     status          TEXT NOT NULL CHECK (status IN
-                        ('queued','processing','published','failed')),
+                        ('queued','processing','finalizing','published','failed')),
     input_hash      TEXT NOT NULL,
     barcode_table   TEXT NOT NULL,
     r1_incoming     TEXT NOT NULL,
@@ -29,7 +29,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     instance_id     TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
-    heartbeat_at    TEXT
+    heartbeat_at    TEXT,
+    attempt_id      TEXT,
+    cleanup_pending INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS job_samples (
@@ -70,7 +72,35 @@ CREATE TABLE IF NOT EXISTS snapshot_lanes (
 );
 """
 
+# Canonical jobs-table definition, reused by the CHECK-constraint migration.
+_JOBS_TABLE_SQL = """
+CREATE TABLE jobs (
+    job_id          TEXT PRIMARY KEY,
+    lane            TEXT NOT NULL UNIQUE,
+    status          TEXT NOT NULL CHECK (status IN
+                        ('queued','processing','finalizing','published','failed')),
+    input_hash      TEXT NOT NULL,
+    barcode_table   TEXT NOT NULL,
+    r1_incoming     TEXT NOT NULL,
+    r2_incoming     TEXT NOT NULL,
+    error           TEXT,
+    instance_id     TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    heartbeat_at    TEXT,
+    attempt_id      TEXT,
+    cleanup_pending INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+_JOB_COLUMNS = (
+    "job_id, lane, status, input_hash, barcode_table, r1_incoming, "
+    "r2_incoming, error, instance_id, created_at, updated_at, heartbeat_at, "
+    "attempt_id, cleanup_pending"
+)
+
 _local = threading.local()
+_hb_local = threading.local()
 
 
 def _now() -> str:
@@ -86,14 +116,34 @@ def get_conn() -> sqlite3.Connection:
     conn = getattr(_local, "conn", None)
     if conn is None:
         conn = sqlite3.connect(
-            config.DB_PATH, timeout=30, isolation_level=None, check_same_thread=False
+            config.DB_PATH, timeout=config.BUSY_TIMEOUT_MS / 1000,
+            isolation_level=None, check_same_thread=False,
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute(f"PRAGMA busy_timeout={config.BUSY_TIMEOUT_MS}")
         conn.execute("PRAGMA foreign_keys=ON")
         _local.conn = conn
+    return conn
+
+
+def _heartbeat_conn() -> sqlite3.Connection:
+    """Advisory-heartbeat connection with a short busy timeout.
+
+    A locked database must not stall demultiplexing for the full busy
+    timeout on every flush; heartbeat failures are tolerated by the caller.
+    """
+    conn = getattr(_hb_local, "conn", None)
+    if conn is None:
+        conn = sqlite3.connect(
+            config.DB_PATH, timeout=config.HEARTBEAT_BUSY_TIMEOUT_MS / 1000,
+            isolation_level=None, check_same_thread=False,
+        )
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(f"PRAGMA busy_timeout={config.HEARTBEAT_BUSY_TIMEOUT_MS}")
+        _hb_local.conn = conn
     return conn
 
 
@@ -112,6 +162,44 @@ def tx() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     conn = get_conn()
     conn.executescript(_SCHEMA)
+    _migrate_jobs(conn)
+
+
+def _migrate_jobs(conn: sqlite3.Connection) -> None:
+    """Bring pre-finalization databases up to the current jobs schema.
+
+    Adds the attempt/cleanup columns when missing and rebuilds the table
+    when the status CHECK constraint predates the 'finalizing' state.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+    if "attempt_id" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN attempt_id TEXT")
+    if "cleanup_pending" not in cols:
+        conn.execute(
+            "ALTER TABLE jobs ADD COLUMN cleanup_pending "
+            "INTEGER NOT NULL DEFAULT 0")
+    sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'"
+    ).fetchone()["sql"]
+    if "'finalizing'" in sql:
+        return
+    # SQLite cannot alter a CHECK constraint: rebuild the table.
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("BEGIN")
+    try:
+        conn.execute(_JOBS_TABLE_SQL.replace("CREATE TABLE jobs",
+                                             "CREATE TABLE jobs_new"))
+        conn.execute(
+            f"INSERT INTO jobs_new ({_JOB_COLUMNS}) "
+            f"SELECT {_JOB_COLUMNS} FROM jobs")
+        conn.execute("DROP TABLE jobs")
+        conn.execute("ALTER TABLE jobs_new RENAME TO jobs")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 # ---------- job helpers ----------
@@ -162,7 +250,13 @@ def get_samples(job_id: str) -> list[sqlite3.Row]:
 
 
 def claim_next_job(instance_id: str) -> sqlite3.Row | None:
-    """Atomically take one queued job. Returns None when the queue is empty."""
+    """Atomically take one queued job. Returns None when the queue is empty.
+
+    Each claim mints a fresh attempt token; finalization writes for an
+    older attempt are no-ops, so a late finisher can never clobber a
+    retried attempt.
+    """
+    attempt_id = uuid.uuid4().hex
     with tx() as conn:
         row = conn.execute(
             "SELECT * FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1"
@@ -171,27 +265,45 @@ def claim_next_job(instance_id: str) -> sqlite3.Row | None:
             return None
         conn.execute(
             """UPDATE jobs SET status='processing', instance_id=?,
-                               updated_at=?, heartbeat_at=?
+                               attempt_id=?, updated_at=?, heartbeat_at=?
                WHERE job_id=?""",
-            (instance_id, _now(), _now(), row["job_id"]),
+            (instance_id, attempt_id, _now(), _now(), row["job_id"]),
         )
     return get_job(row["job_id"])
 
 
-def heartbeat(job_id: str, instance_id: str) -> None:
-    get_conn().execute(
-        "UPDATE jobs SET heartbeat_at=? WHERE job_id=? AND instance_id=?",
-        (_now(), job_id, instance_id),
+def heartbeat(job_id: str, attempt_id: str | None) -> None:
+    """Best-effort liveness touch; raises on lock timeout (caller tolerates)."""
+    _heartbeat_conn().execute(
+        "UPDATE jobs SET heartbeat_at=? WHERE job_id=? AND attempt_id IS ?",
+        (_now(), job_id, attempt_id),
     )
 
 
-def mark_failed(job_id: str, instance_id: str, error: str) -> None:
-    with tx() as conn:
-        conn.execute(
-            """UPDATE jobs SET status='failed', error=?, updated_at=?
-               WHERE job_id=? AND instance_id=?""",
-            (error[:2000], _now(), job_id, instance_id),
-        )
+def set_finalizing(job_id: str, attempt_id: str | None) -> bool:
+    """Mark a still-owned job as finishing up (staging not yet clean)."""
+    cur = get_conn().execute(
+        """UPDATE jobs SET status='finalizing', updated_at=?
+           WHERE job_id=? AND attempt_id IS ? AND status='processing'""",
+        (_now(), job_id, attempt_id),
+    )
+    return cur.rowcount == 1
+
+
+def mark_failed(job_id: str, attempt_id: str | None, error: str) -> bool:
+    """Record the failure of one attempt.
+
+    Guarded by the attempt token and the pre-failure states: returns False
+    when the job has meanwhile been finalized by someone else or retried,
+    in which case the caller must drop its own finalization.
+    """
+    cur = get_conn().execute(
+        """UPDATE jobs SET status='failed', error=?, updated_at=?
+           WHERE job_id=? AND attempt_id IS ?
+                 AND status IN ('processing','finalizing')""",
+        (error[:2000], _now(), job_id, attempt_id),
+    )
+    return cur.rowcount == 1
 
 
 def requeue_job(job_id: str) -> bool:
@@ -205,15 +317,32 @@ def requeue_job(job_id: str) -> bool:
             return False
         conn.execute(
             """UPDATE jobs SET status='queued', error=NULL, instance_id=NULL,
-                               updated_at=?, heartbeat_at=NULL WHERE job_id=?""",
+                               attempt_id=NULL, updated_at=?, heartbeat_at=NULL
+               WHERE job_id=?""",
             (_now(), job_id),
         )
     return True
 
 
-def publish_job(job_id: str, lane: str, counts: list[dict[str, Any]]) -> None:
-    """Publish metadata atomically; files are moved in beforehand."""
+def publish_job(job_id: str, lane: str, counts: list[dict[str, Any]],
+                attempt_id: str | None) -> None:
+    """Publish metadata atomically; files are moved in beforehand.
+
+    The job flips to published with cleanup_pending=1 in the same commit:
+    if the process dies before the original inputs are reclaimed, the
+    janitor (or the next startup) finishes the reclamation.
+    """
     with tx() as conn:
+        cur = conn.execute(
+            """UPDATE jobs SET status='published', cleanup_pending=1,
+                              updated_at=?
+               WHERE job_id=? AND attempt_id IS ? AND status='processing'""",
+            (_now(), job_id, attempt_id),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"job {job_id} is no longer owned by this attempt; "
+                "refusing to publish")
         next_seq = conn.execute(
             "SELECT COALESCE(MAX(seq),0)+1 AS s FROM lane_publishes").fetchone()["s"]
         conn.execute(
@@ -226,10 +355,32 @@ def publish_job(job_id: str, lane: str, counts: list[dict[str, Any]]) -> None:
                VALUES (:lane,:sample_id,:r1_file,:r2_file,:read_pairs)""",
             [{**c, "lane": lane} for c in counts],
         )
-        conn.execute(
-            "UPDATE jobs SET status='published', updated_at=? WHERE job_id=?",
-            (_now(), job_id),
-        )
+
+
+def clear_cleanup_pending(job_id: str) -> bool:
+    """Flag a published job's original-input reclamation as complete."""
+    cur = get_conn().execute(
+        """UPDATE jobs SET cleanup_pending=0, updated_at=?
+           WHERE job_id=? AND status='published'""",
+        (_now(), job_id),
+    )
+    return cur.rowcount == 1
+
+
+def jobs_for_reap(cutoff_iso: str) -> list[sqlite3.Row]:
+    """Processing/finalizing jobs whose heartbeat is older than the cutoff."""
+    return get_conn().execute(
+        """SELECT * FROM jobs
+           WHERE status IN ('processing','finalizing')
+                 AND COALESCE(heartbeat_at, updated_at) < ?""",
+        (cutoff_iso,),
+    ).fetchall()
+
+
+def published_pending_cleanup() -> list[sqlite3.Row]:
+    return get_conn().execute(
+        "SELECT * FROM jobs WHERE status='published' AND cleanup_pending=1"
+    ).fetchall()
 
 
 # ---------- published lanes / snapshots ----------

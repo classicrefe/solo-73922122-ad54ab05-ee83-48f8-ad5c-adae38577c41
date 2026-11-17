@@ -15,6 +15,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 
 from . import config, db, processing
+from .janitor import Janitor
 from .worker import JobWorker, new_instance_id
 
 _IO_CHUNK = 1024 * 1024
@@ -92,6 +93,8 @@ def _job_public(row) -> dict[str, Any]:
         Path(row["r1_incoming"]).is_file() and Path(row["r2_incoming"]).is_file())
     out.pop("r1_incoming", None)
     out.pop("r2_incoming", None)
+    out.pop("attempt_id", None)  # internal finalization guard
+    out["cleanup_pending"] = bool(out.get("cleanup_pending"))
     if row["status"] == "published":
         out["samples"] = [
             dict(c) for c in db.lane_counts(row["lane"])]
@@ -115,15 +118,19 @@ async def lifespan(app: FastAPI):
     for note in notes:
         log.info("startup recovery: %s", note)
     instance_id = new_instance_id()
-    worker = JobWorker(instance_id)
+    janitor = Janitor(instance_id)
+    worker = JobWorker(instance_id, janitor)
     app.state.instance_id = instance_id
+    app.state.janitor = janitor
     app.state.worker = worker
+    janitor.start()
     worker.start()
     log.info("instance %s ready, data dir %s", instance_id, config.DATA_DIR)
     try:
         yield
     finally:
         worker.stop()
+        janitor.stop()
 
 
 app = FastAPI(
@@ -135,7 +142,10 @@ app = FastAPI(
         "with at most one substitution and a unique candidate; everything "
         "else is quarantined. Barcodes and qualities are trimmed on "
         "assignment. Published lanes, per-sample files, quarantine files and "
-        "counts become visible atomically."
+        "counts become visible atomically. Failed jobs pass through a "
+        "finalizing state (staging cleaned, failure recorded) before they "
+        "can be retried; published jobs keep their counts and downloads "
+        "while original-upload reclamation finishes in the background."
     ),
     lifespan=lifespan,
 )
@@ -149,10 +159,12 @@ def root():
 @app.get("/health")
 def health():
     worker: JobWorker = app.state.worker
+    janitor: Janitor = app.state.janitor
     return {
         "status": "ok",
         "instance_id": app.state.instance_id,
         "current_job": worker.current_job,
+        "pending_finalizations": janitor.pending,
         "queued_jobs": db.get_conn().execute(
             "SELECT COUNT(*) c FROM jobs WHERE status='queued'").fetchone()["c"],
     }
@@ -252,6 +264,11 @@ def retry_job(job_id: str):
     row = db.get_job(job_id)
     if row is None:
         raise HTTPException(404, "job not found")
+    if row["status"] in ("processing", "finalizing"):
+        # Finalization has not landed yet: staging may still be dirty and
+        # the failure is not durable, so a retry now could double-run.
+        raise HTTPException(
+            409, f"job is {row['status']}; wait for finalization to finish")
     if row["status"] != "failed":
         raise HTTPException(409, f"job is {row['status']}, only failed jobs retry")
     for key in ("r1_incoming", "r2_incoming"):

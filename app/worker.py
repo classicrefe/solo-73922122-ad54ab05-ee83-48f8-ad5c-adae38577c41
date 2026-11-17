@@ -3,15 +3,19 @@
 Runs in a daemon thread inside the uvicorn process. While a slow lane is
 being processed the event loop keeps serving uploads, queries and downloads;
 the poller simply does not claim another job until the current one finishes.
+
+Failure finalization is handed to the janitor so a locked SQLite or a sick
+filesystem never wedges this thread: the worker moves on to the next lane
+while the janitor keeps retrying the handoff until it lands.
 """
 from __future__ import annotations
 
 import logging
 import threading
-import time
 import uuid
 
 from . import config, db, processing
+from .janitor import Janitor
 
 log = logging.getLogger("demux.worker")
 
@@ -21,9 +25,10 @@ def new_instance_id() -> str:
 
 
 class JobWorker(threading.Thread):
-    def __init__(self, instance_id: str):
+    def __init__(self, instance_id: str, janitor: Janitor):
         super().__init__(name=f"demux-worker-{instance_id[:8]}", daemon=True)
         self.instance_id = instance_id
+        self.janitor = janitor
         self._stop = threading.Event()
         self.current_job: str | None = None
 
@@ -45,22 +50,23 @@ class JobWorker(threading.Thread):
             log.info("instance %s claimed job %s lane %s",
                      self.instance_id, job["job_id"], job["lane"])
             try:
-                processing.process_job(job, self.instance_id)
+                processing.process_job(job, self.instance_id, self.janitor)
                 log.info("job %s published", job["job_id"])
             except processing.FastqFormatError as exc:
                 log.warning("job %s failed on format: %s", job["job_id"], exc)
-                self._fail(job, f"FASTQ format error: {exc}")
+                self._finish_failure(job, f"FASTQ format error: {exc}")
             except processing.SizeExceededError as exc:
                 log.warning("job %s failed on size: %s", job["job_id"], exc)
-                self._fail(job, str(exc))
+                self._finish_failure(job, str(exc))
             except Exception:
                 log.exception("job %s crashed", job["job_id"])
-                self._fail(job, "internal processing error")
+                self._finish_failure(job, "internal processing error")
             finally:
                 self.current_job = None
 
-    def _fail(self, job, message: str) -> None:
-        try:
-            db.mark_failed(job["job_id"], self.instance_id, message)
-        except Exception:
-            log.exception("could not mark job %s failed", job["job_id"])
+    def _finish_failure(self, job, message: str) -> None:
+        # The janitor cleans staging and records the failure, retrying
+        # through SQLite lock storms and storage faults. The job stays
+        # non-retryable (processing/finalizing) until that lands.
+        self.janitor.enqueue_failure(
+            job["job_id"], job["attempt_id"], message)

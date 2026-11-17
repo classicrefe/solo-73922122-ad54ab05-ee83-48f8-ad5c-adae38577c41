@@ -7,7 +7,10 @@ Simulates the docker-compose deployment:
     and query/download stay responsive;
   * jobs are claimed by exactly one instance each and work is shared;
   * duplicate submissions reuse the task, conflicting input is rejected;
-  * snapshots fix the published lane set.
+  * snapshots fix the published lane set;
+  * a SQLite write-lock fault neither blocks queries/downloads nor wedges
+    failure finalization: once the lock clears, the lane reaches a
+    retryable failed state.
 
 Hard-crash recovery (SIGKILL mid-lane) is covered by the pytest suite
 (tests/test_failure_and_recovery.py) because some sandboxes forbid kill().
@@ -221,16 +224,71 @@ def main() -> int:
         boundary, body = multipart("laneIT0", bad_barcodes, r1, r2)
         code, resp = http("POST", f"{BASE_B}/jobs", raw_path=(boundary, body))
         assert code == 409, (code, resp)
+
+        print("[6] SQLite write-lock fault drill")
+        print("    readers (query/download) stay up; failure finalization")
+        print("    lands after the lock clears; lane becomes retryable")
+        import sqlite3
+        import threading
+
+        # A corrupt lane submitted just before the fault: its failure
+        # registration must ride out the lock, not get stuck.
+        bad_r1 = data_dir / "fixture" / "badR1.fastq.gz"
+        bad_r1.write_bytes(r1.read_bytes()[:-6])  # truncated gzip
+        boundary, body = multipart("laneLock", barcodes, bad_r1, r2)
+        code, resp = http("POST", f"{BASE_A}/jobs", raw_path=(boundary, body))
+        assert code == 201, (code, resp)
+        lock_jid = json.loads(resp)["job"]["job_id"]
+
+        lock_conn = sqlite3.connect(str(data_dir / "demux.db"),
+                                    isolation_level=None,
+                                    check_same_thread=False)
+        lock_conn.execute("BEGIN IMMEDIATE")
+        lock_held = threading.Event()
+        lock_held.set()
+
+        def release_later(seconds: float) -> None:
+            time.sleep(seconds)
+            lock_conn.rollback()
+            lock_conn.close()
+            lock_held.clear()
+
+        releaser = threading.Thread(target=release_later, args=(3.0,))
+        releaser.start()
+        try:
+            t0 = time.time()
+            for base in (BASE_A, BASE_B):
+                code, _ = http("GET", f"{base}/health")
+                assert code == 200
+                code, _ = http("GET", f"{base}/jobs")
+                assert code == 200
+                code, body = http(
+                    "GET", f"{base}/lanes/laneIT0/samples/sampleA/r1")
+                assert code == 200 and len(body) > 0
+            assert time.time() - t0 < 10, "reads must not wait out the lock"
+            print("    queries and downloads served during the write lock")
+        finally:
+            releaser.join()
+        assert not lock_held.is_set()
+
+        row = wait_job(BASE_A, lock_jid)
+        assert row["status"] == "failed", row  # finalized, not stuck
+        assert row["uploads_retained"] is True
+        code, resp = http("POST", f"{BASE_B}/jobs/{lock_jid}/retry")
+        assert code == 200, (code, resp)
+        row = wait_job(BASE_B, lock_jid)
+        assert row["status"] == "failed"  # input still corrupt
+        print("    lock released -> failure recorded -> retry accepted")
     finally:
         signalled = [stop(p) for p in procs]
 
     if not all(signalled):
-        print("\n[6] SKIPPED hard-crash section: sandbox denies process signals")
+        print("\n[7] SKIPPED hard-crash section: sandbox denies process signals")
         print("    Crash recovery is covered by: pytest tests/test_failure_and_recovery.py")
         print("\nINTEGRATION CHECKS PASSED (crash section skipped here)")
         return 0
 
-    print("[6] hard-crash recovery (SIGKILL mid-lane, restart cleanup)")
+    print("[7] hard-crash recovery (SIGKILL mid-lane, restart cleanup)")
     c = start_instance(PORT_A, data_dir)
     try:
         boundary, body = multipart("laneCrash", barcodes, r1, r2)

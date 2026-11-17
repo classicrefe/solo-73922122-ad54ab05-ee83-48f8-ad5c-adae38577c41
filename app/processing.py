@@ -9,6 +9,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import gzip
+import logging
 import os
 import shutil
 import time
@@ -18,6 +19,8 @@ from pathlib import Path
 from typing import Iterator
 
 from . import config, db
+
+log = logging.getLogger("demux.processing")
 
 QUARANTINE = "__quarantine__"
 _VALID_BASES = frozenset(b"ACGTN")
@@ -207,10 +210,16 @@ def acquire_job_lock(job_id: str):
     return fh
 
 
-def process_job(job_row, instance_id: str) -> None:
-    """Full lifecycle: split -> stage -> atomic publish -> metadata."""
+def process_job(job_row, instance_id: str, janitor) -> None:
+    """Full lifecycle: split -> stage -> atomic publish -> metadata.
+
+    Post-publish reclamation of the original uploads is handed to the
+    janitor: a committed publish must never be converted into a failure by
+    a flaky unlink, and a slow delete must not stall the worker.
+    """
     job_id = job_row["job_id"]
     lane = job_row["lane"]
+    attempt_id = job_row["attempt_id"]
     sample_rows = db.get_samples(job_id)
     keys = [
         SampleKey(
@@ -228,6 +237,7 @@ def process_job(job_row, instance_id: str) -> None:
     staged = work / "output"
     tmp_publish = config.PUBLISHED_DIR / "lanes" / f".tmp.{job_id}"
     final_publish = config.PUBLISHED_DIR / "lanes" / lane
+    published = False
     try:
         # Remove leftovers from a previous crashed attempt of this same job.
         if staged.exists():
@@ -256,7 +266,14 @@ def process_job(job_row, instance_id: str) -> None:
                     writers.write(bucket, "r2", r2, trimmed=True)
                 counts[bucket] += 1
                 if pair_index % config.HEARTBEAT_FLUSH_EVERY == 0:
-                    db.heartbeat(job_id, instance_id)
+                    try:
+                        db.heartbeat(job_id, attempt_id)
+                    except Exception:
+                        # Advisory only: a locked database must not kill a
+                        # healthy lane. The flock, not the heartbeat, is the
+                        # ownership authority for recovery.
+                        log.warning("job %s heartbeat failed; continuing",
+                                    job_id, exc_info=True)
         finally:
             writers.close()
 
@@ -289,9 +306,117 @@ def process_job(job_row, instance_id: str) -> None:
             }
             for bucket, n in counts.items()
         ]
-        db.publish_job(job_id, lane, count_rows)
+        db.publish_job(job_id, lane, count_rows, attempt_id)
+        published = True
+    finally:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock.close()
+    if published:
+        # Publish is durable; reclaiming inputs/scratch is best-effort and
+        # retried by the janitor until cleanup_pending flips to 0.
+        janitor.enqueue_publish_cleanup(job_id)
 
-        # Publish is durable; only now remove inputs and scratch space.
+
+# ---------------- finalization (task end <-> file reclamation) ----------------
+
+def finalize_failed_job(job_id: str, attempt_id: str | None,
+                        error: str) -> bool:
+    """Finish an unpublished job: clean staging, then record the failure.
+
+    Returns True once the job is terminally failed (or the finalization is
+    moot because the job moved on), False when a storage/SQLite fault
+    interrupted the handoff and it must be retried later. Both mates of the
+    original upload are always retained so the job can be retried.
+
+    Serialized on the job flock and guarded by the attempt token, so a late
+    finalization can never delete a newer attempt's staging or products.
+    Never raises: any storage/SQLite fault means "try again later".
+    """
+    fh = None
+    try:
+        row = db.get_job(job_id)
+        if row is None or row["status"] not in ("processing", "finalizing"):
+            return True  # already finalized, published, or requeued: moot
+        if attempt_id is not None and row["attempt_id"] != attempt_id:
+            return True  # a newer attempt owns the job now: moot
+
+        wd = _work_dir(job_id)
+        wd.mkdir(parents=True, exist_ok=True)
+        fh = open(_lock_path(job_id), "w")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                return False  # someone is actively working/finalizing it
+            raise
+        # Re-read under the flock: the state may have moved while we
+        # were waiting for the lock.
+        row = db.get_job(job_id)
+        if row is None or row["status"] not in ("processing", "finalizing"):
+            return True
+        token = row["attempt_id"]
+        if attempt_id is not None and token != attempt_id:
+            return True
+        lane = row["lane"]
+        try:
+            db.set_finalizing(job_id, token)
+        except Exception:
+            log.warning("job %s: could not flag finalizing state",
+                        job_id, exc_info=True)
+
+        # 1. Clean staging first: scratch output, half-moved publish
+        #    staging, and a lane directory that never became visible.
+        staged = wd / "output"
+        if staged.exists():
+            shutil.rmtree(staged)
+        tmp = config.PUBLISHED_DIR / "lanes" / f".tmp.{job_id}"
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        final = config.PUBLISHED_DIR / "lanes" / lane
+        if final.exists() and db.get_conn().execute(
+                "SELECT 1 FROM lane_publishes WHERE lane=?",
+                (lane,)).fetchone() is None:
+            shutil.rmtree(final)
+
+        # 2. Only now record the failure; the attempt guard makes a
+        #    late write a no-op instead of a clobber.
+        marked = db.mark_failed(job_id, token, error)
+        if marked:
+            # Scratch is clean and the failure is durable: the work dir
+            # (only the lock file remains) can go. Best-effort.
+            shutil.rmtree(wd, ignore_errors=True)
+        return True
+    except Exception:
+        log.warning("job %s finalization incomplete; will retry",
+                    job_id, exc_info=True)
+        return False
+    finally:
+        if fh is not None:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            fh.close()
+
+
+def cleanup_published_job(job_id: str) -> bool:
+    """Reclaim a published job's original uploads and scratch.
+
+    The job stays published with its counts and downloads untouched the
+    whole time; only cleanup_pending tracks that reclamation is due.
+    Returns False when a storage fault interrupted the cleanup so the
+    janitor retries it later (idempotently). Never raises.
+    """
+    try:
+        row = db.get_job(job_id)
+        if row is None or row["status"] != "published":
+            return True  # moot
+        if not row["cleanup_pending"]:
+            return True
+        r1_in = Path(row["r1_incoming"])
+        r2_in = Path(row["r2_incoming"])
         for p in (r1_in, r2_in):
             try:
                 p.unlink()
@@ -302,12 +427,15 @@ def process_job(job_row, instance_id: str) -> None:
             incoming_dir.rmdir()
         except OSError:
             pass
-        shutil.rmtree(work, ignore_errors=True)
-    finally:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-        finally:
-            lock.close()
+        wd = _work_dir(job_id)
+        if wd.exists():
+            shutil.rmtree(wd)
+        db.clear_cleanup_pending(job_id)
+        return True
+    except Exception:
+        log.warning("job %s publish cleanup incomplete; will retry",
+                    job_id, exc_info=True)
+        return False
 
 
 # ---------------- startup recovery ----------------
@@ -333,30 +461,46 @@ def _lock_is_free(path: Path) -> bool:
 def recover_on_startup() -> list[str]:
     """Clean debris from truly interrupted runs. Never touches live or
     published data: flock ownership protects live instances, DB rows protect
-    published lanes."""
+    published lanes. Finalization that hits a still-sick storage is left
+    for the janitor, which keeps retrying after startup."""
     notes: list[str] = []
     conn = db.get_conn()
 
-    # 1. Jobs stuck in 'processing' whose owner lock is free (process dead).
-    #    The flock is the authority: a live instance always holds it, so a
-    #    free lock means the owner truly disappeared even if the heartbeat
-    #    timestamp happens to look fresh.
+    # 1. Jobs stuck in 'processing'/'finalizing' whose owner lock is free
+    #    (process dead). The flock is the authority: a live instance always
+    #    holds it, so a free lock means the owner truly disappeared even if
+    #    the heartbeat timestamp happens to look fresh.
     for job in conn.execute(
-            "SELECT * FROM jobs WHERE status='processing'").fetchall():
+            "SELECT * FROM jobs WHERE status IN ('processing','finalizing')"
+    ).fetchall():
         lock = _lock_path(job["job_id"])
         if not _lock_is_free(lock):
             continue  # another instance is actively working this job
-        notes.append(f"recovering interrupted job {job['job_id']}")
-        conn.execute(
-            "UPDATE jobs SET status='failed', instance_id=NULL,"
-            "error='interrupted (owner process disappeared)', updated_at=? "
-            "WHERE job_id=?", (db.utcnow(), job["job_id"]))
-        _remove_job_scratch(job, notes)
+        if finalize_failed_job(job["job_id"], job["attempt_id"],
+                               "interrupted (owner process disappeared)"):
+            notes.append(f"recovered interrupted job {job['job_id']}")
+        else:
+            notes.append(
+                f"job {job['job_id']} finalization deferred (storage fault)")
 
-    # 2. Orphan work directories with no processing job attached.
+    # 2. Published jobs whose original-input reclamation was interrupted.
+    #    Counts and downloads are already visible; only the leftover
+    #    uploads/scratch are reclaimed here.
+    for job in conn.execute(
+            "SELECT job_id FROM jobs WHERE status='published' "
+            "AND cleanup_pending=1").fetchall():
+        if cleanup_published_job(job["job_id"]):
+            notes.append(f"finished publish cleanup for job {job['job_id']}")
+        else:
+            notes.append(
+                f"publish cleanup for job {job['job_id']} deferred "
+                "(storage fault)")
+
+    # 3. Orphan work directories with no live job attached.
     live_jobs = {
         r["job_id"] for r in conn.execute(
-            "SELECT job_id FROM jobs WHERE status='processing'").fetchall()
+            "SELECT job_id FROM jobs WHERE status IN "
+            "('processing','finalizing')").fetchall()
     }
     for wd in config.WORK_DIR.iterdir():
         if not wd.is_dir() or wd.name in live_jobs:
@@ -369,7 +513,7 @@ def recover_on_startup() -> list[str]:
         notes.append(f"removing orphan work directory {wd.name}")
         shutil.rmtree(wd, ignore_errors=True)
 
-    # 3. Unpublished staging directories left by a crashed publish.
+    # 4. Unpublished staging directories left by a crashed publish.
     lanes_root = config.PUBLISHED_DIR / "lanes"
     if lanes_root.exists():
         published = {r["lane"] for r in conn.execute(
@@ -380,7 +524,8 @@ def recover_on_startup() -> list[str]:
             if child.name.startswith(".tmp."):
                 job_id = child.name[len(".tmp."):]
                 job = jobs_by_id.get(job_id)
-                if job is not None and job["status"] == "processing" \
+                if job is not None and job["status"] in (
+                        "processing", "finalizing") \
                         and not _lock_is_free(_lock_path(job_id)):
                     continue
                 notes.append(f"removing unfinished publish staging {child.name}")
@@ -390,7 +535,8 @@ def recover_on_startup() -> list[str]:
                 # visible; safe to remove unless a live owner is publishing.
                 guarded = False
                 for job in jobs_by_id.values():
-                    if job["lane"] == child.name and job["status"] == "processing" \
+                    if job["lane"] == child.name and job["status"] in (
+                            "processing", "finalizing") \
                             and not _lock_is_free(_lock_path(job["job_id"])):
                         guarded = True
                         break
@@ -399,7 +545,7 @@ def recover_on_startup() -> list[str]:
                         f"removing unpublished lane directory {child.name}")
                     shutil.rmtree(child, ignore_errors=True)
 
-    # 4. Incoming debris of jobs that no longer need their uploads.
+    # 5. Incoming debris of jobs that no longer need their uploads.
     #    A directory without a COMPLETE marker is an upload still streaming
     #    (or a freshly aborted one younger than the grace period) and is
     #    never touched, so another instance's in-flight upload is safe.
@@ -407,7 +553,7 @@ def recover_on_startup() -> list[str]:
         Path(r["r1_incoming"]).parent.name
         for r in conn.execute(
             "SELECT r1_incoming FROM jobs WHERE status IN "
-            "('queued','processing','failed')").fetchall()
+            "('queued','processing','finalizing','failed')").fetchall()
     }
     grace_seconds = 3600
     if config.INCOMING_DIR.exists():
@@ -423,20 +569,3 @@ def recover_on_startup() -> list[str]:
             notes.append(f"removing stale incoming upload {d.name}")
             shutil.rmtree(d, ignore_errors=True)
     return notes
-
-
-def _remove_job_scratch(job_row, notes: list[str]) -> None:
-    job_id = job_row["job_id"]
-    lane = job_row["lane"]
-    wd = _work_dir(job_id)
-    if wd.exists():
-        shutil.rmtree(wd, ignore_errors=True)
-    tmp = config.PUBLISHED_DIR / "lanes" / f".tmp.{job_id}"
-    if tmp.exists():
-        shutil.rmtree(tmp, ignore_errors=True)
-    final = config.PUBLISHED_DIR / "lanes" / lane
-    if final.exists() and db.get_conn().execute(
-            "SELECT 1 FROM lane_publishes WHERE lane=?",
-            (lane,)).fetchone() is None:
-        shutil.rmtree(final, ignore_errors=True)
-    notes.append(f"cleared scratch for job {job_id}")

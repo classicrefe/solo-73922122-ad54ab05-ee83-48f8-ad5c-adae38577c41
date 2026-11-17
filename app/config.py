@@ -37,5 +37,20 @@ MAX_TOTAL_UNCOMPRESSED = 512 * 1024 * 1024  # 512 MiB across both mates
 HEARTBEAT_FLUSH_EVERY = 256  # records between heartbeat writes
 POLL_INTERVAL = float(os.environ.get("DEMUX_POLL_INTERVAL", "1.0"))
 
+# SQLite waits. These are never *extended* to ride out storage faults: the
+# janitor retries finalization instead of blocking longer.
+BUSY_TIMEOUT_MS = int(os.environ.get("DEMUX_SQLITE_BUSY_TIMEOUT_MS", "30000"))
+# Heartbeats are advisory; they fail fast on a dedicated connection so a
+# locked database slows the lane by at most this much per flush.
+HEARTBEAT_BUSY_TIMEOUT_MS = int(
+    os.environ.get("DEMUX_HEARTBEAT_BUSY_TIMEOUT_MS", "1000"))
+
+# Finalization (janitor) cadence and orphan reaping.
+JANITOR_INTERVAL = float(os.environ.get("DEMUX_JANITOR_INTERVAL", "2.0"))
+# A processing/finalizing job whose flock is free AND whose heartbeat is
+# older than this is considered abandoned and gets finalized by the reaper.
+# The freshness check protects the brief claim->flock-acquire window.
+REAP_AFTER_SECONDS = float(os.environ.get("DEMUX_REAP_AFTER_SECONDS", "60"))
+
 for _d in (DATA_DIR, INCOMING_DIR, WORK_DIR, PUBLISHED_DIR):
     _d.mkdir(parents=True, exist_ok=True)
